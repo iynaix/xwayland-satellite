@@ -35,6 +35,7 @@ bitflags = "2.5.0"
 rustix = { workspace = true, features = ["event"] }
 wayland-client.workspace = true
 wayland-protocols = { workspace = true, features = ["client", "server", "staging", "unstable"] }
+wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
 wayland-server.workspace = true
 xcb = { version = "1.7.0", features = ["composite", "randr", "res"] }
 wl_drm = { path = "wl_drm" }

@@ -6,6 +6,7 @@ use log::{debug, error, trace, warn};
 use macros::simple_event_shunt;
 use std::os::fd::AsFd;
 use wayland_client::{Proxy, protocol as client};
+use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
 use wayland_protocols::{
     wp::{
         fractional_scale::v1::client::wp_fractional_scale_v1,
@@ -65,6 +66,7 @@ pub(crate) enum SurfaceEvents {
     XdgSurface(xdg_surface::Event),
     Toplevel(xdg_toplevel::Event),
     Popup(xdg_popup::Event),
+    LayerSurface(zwlr_layer_surface_v1::Event),
     FractionalScale(wp_fractional_scale_v1::Event),
     DecorationEvent(zxdg_toplevel_decoration_v1::Event),
 }
@@ -81,6 +83,7 @@ impl_from!(client::wl_surface::Event, WlSurface);
 impl_from!(xdg_surface::Event, XdgSurface);
 impl_from!(xdg_toplevel::Event, Toplevel);
 impl_from!(xdg_popup::Event, Popup);
+impl_from!(zwlr_layer_surface_v1::Event, LayerSurface);
 impl_from!(wp_fractional_scale_v1::Event, FractionalScale);
 impl_from!(zxdg_toplevel_decoration_v1::Event, DecorationEvent);
 
@@ -121,6 +124,7 @@ impl Event for SurfaceEvents {
                 }
                 _ => unreachable!(),
             },
+            SurfaceEvents::LayerSurface(event) => Self::layer_surface_event(event, target, state),
             SurfaceEvents::DecorationEvent(event) => {
                 use zxdg_toplevel_decoration_v1::{Event, Mode};
                 let Event::Configure { mode } = event else {
@@ -450,6 +454,80 @@ impl SurfaceEvents {
                     .unmap_window(*data.get::<&x::Window>().unwrap());
             }
             other => todo!("{other:?}"),
+        }
+    }
+
+    fn layer_surface_event<C: XConnection>(
+        event: zwlr_layer_surface_v1::Event,
+        target: Entity,
+        state: &mut ServerState<C>,
+    ) {
+        let connection = &mut state.connection;
+        let state = &mut state.inner;
+        let data = state.world.entity(target).unwrap();
+        match event {
+            zwlr_layer_surface_v1::Event::Configure {
+                serial,
+                width: _,
+                height: _,
+            } => {
+                debug!(
+                    "layer surface configure {}",
+                    data.get::<&WlSurface>().unwrap().id()
+                );
+
+                let mut role = data.get::<&mut SurfaceRole>().unwrap();
+                if let SurfaceRole::LayerSurface(Some(layer)) = &mut *role {
+                    layer.layer_surface.ack_configure(serial);
+                    layer.configured = true;
+
+                    // Now that the scale factor is known, set the correct margins
+                    let mut query = data.query::<(&WindowData, &SurfaceScaleFactor)>();
+                    let (window_data, scale) = query.get().unwrap();
+                    let margin_left =
+                        ((window_data.attrs.dims.x as i32 - window_data.output_offset.x) as f64
+                            / scale.0) as i32;
+                    let margin_top =
+                        ((window_data.attrs.dims.y as i32 - window_data.output_offset.y) as f64
+                            / scale.0) as i32;
+                    let width = (window_data.attrs.dims.width as f64 / scale.0).ceil() as u32;
+                    let height = (window_data.attrs.dims.height as f64 / scale.0).ceil() as u32;
+                    layer
+                        .layer_surface
+                        .set_size(width.max(1), height.max(1));
+                    layer
+                        .layer_surface
+                        .set_margin(margin_top, 0, 0, margin_left);
+                    drop(query);
+                }
+                drop(role);
+
+                let (surface, attach, callback) = state
+                    .world
+                    .query_one_mut::<(
+                        &client::wl_surface::WlSurface,
+                        Option<&SurfaceAttach>,
+                        Option<&WlCallback>,
+                    )>(target)
+                    .unwrap();
+
+                let mut cmd = CommandBuffer::new();
+
+                if let Some(SurfaceAttach { buffer, x, y }) = attach {
+                    surface.attach(buffer.as_ref(), *x, *y);
+                    cmd.remove_one::<SurfaceAttach>(target);
+                }
+                if let Some(cb) = callback {
+                    surface.frame(&state.qh, cb.clone());
+                    cmd.remove_one::<client::wl_callback::WlCallback>(target);
+                }
+                surface.commit();
+                cmd.run_on(&mut state.world);
+            }
+            zwlr_layer_surface_v1::Event::Closed => {
+                connection.unmap_window(*data.get::<&x::Window>().unwrap());
+            }
+            _ => warn!("unhandled layer surface event: {event:?}"),
         }
     }
 }

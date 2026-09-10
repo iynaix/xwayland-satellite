@@ -92,8 +92,13 @@ impl<S: X11Selection> Dispatch<WlSurface, Entity> for InnerServerState<S> {
     ) {
         let data = state.world.entity(*entity).unwrap();
         let mut role = data.get::<&mut SurfaceRole>();
-        let xdg = role.as_ref().and_then(|role| role.xdg());
-        let configured = xdg.is_none_or(|xdg| xdg.configured);
+        let configured = match role.as_deref() {
+            Some(SurfaceRole::LayerSurface(Some(layer))) => layer.configured,
+            _ => {
+                let xdg = role.as_ref().and_then(|role| role.xdg());
+                xdg.is_none_or(|xdg| xdg.configured)
+            }
+        };
         let client = data.get::<&client::wl_surface::WlSurface>().unwrap();
 
         let mut cmd = CommandBuffer::new();

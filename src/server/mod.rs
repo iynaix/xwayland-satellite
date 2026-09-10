@@ -29,6 +29,10 @@ use wayland_client::{
     globals::{Global, registry_queue_init},
     protocol as client,
 };
+use wayland_protocols_wlr::layer_shell::v1::client::{
+    zwlr_layer_shell_v1::{self, ZwlrLayerShellV1},
+    zwlr_layer_surface_v1::{self, ZwlrLayerSurfaceV1},
+};
 use wayland_protocols::xdg::decoration::zv1::client::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
 use wayland_protocols::xdg::decoration::zv1::client::zxdg_toplevel_decoration_v1::{self};
 use wayland_protocols::xdg::shell::client::xdg_positioner::ConstraintAdjustment;
@@ -192,6 +196,7 @@ struct SurfaceSerial([u32; 2]);
 enum SurfaceRole {
     Toplevel(Option<ToplevelData>),
     Popup(Option<PopupData>),
+    LayerSurface(Option<LayerSurfaceData>),
 }
 
 impl SurfaceRole {
@@ -199,6 +204,7 @@ impl SurfaceRole {
         match self {
             SurfaceRole::Toplevel(t) => t.as_ref().map(|t| &t.xdg),
             SurfaceRole::Popup(p) => p.as_ref().map(|p| &p.xdg),
+            SurfaceRole::LayerSurface(_) => None,
         }
     }
 
@@ -206,6 +212,7 @@ impl SurfaceRole {
         match self {
             SurfaceRole::Toplevel(t) => t.as_mut().map(|t| &mut t.xdg),
             SurfaceRole::Popup(p) => p.as_mut().map(|p| &mut p.xdg),
+            SurfaceRole::LayerSurface(_) => None,
         }
     }
 
@@ -222,6 +229,9 @@ impl SurfaceRole {
                 p.positioner.destroy();
                 p.popup.destroy();
                 p.xdg.surface.destroy();
+            }
+            SurfaceRole::LayerSurface(Some(data)) => {
+                data.layer_surface.destroy();
             }
             _ => {}
         }
@@ -248,6 +258,12 @@ struct PopupData {
     popup: XdgPopup,
     positioner: XdgPositioner,
     xdg: XdgSurfaceData,
+}
+
+#[derive(Debug)]
+struct LayerSurfaceData {
+    layer_surface: ZwlrLayerSurfaceV1,
+    configured: bool,
 }
 
 trait Event {
@@ -477,6 +493,7 @@ pub struct InnerServerState<S: X11Selection> {
     last_hovered: Option<x::Window>,
 
     xdg_wm_base: XdgWmBase,
+    layer_shell: Option<ZwlrLayerShellV1>,
     compositor: client::wl_compositor::WlCompositor,
     subcompositor: WlSubcompositor,
     shm: client::wl_shm::WlShm,
@@ -517,6 +534,13 @@ impl<S: X11Selection> ServerState<NoConnection<S>> {
                 "xdg_wm_base version 2 detected. Popup repositioning will not work, and some popups may not work correctly."
             );
         }
+
+        let layer_shell = global_list
+            .bind::<ZwlrLayerShellV1, _, _>(&qh, 1..=5, ())
+            .inspect_err(|e| {
+                warn!("Could not bind zwlr_layer_shell_v1 ({e:?}). Override-redirect windows will not use layer shell.");
+            })
+            .ok();
 
         let compositor = global_list
             .bind::<client::wl_compositor::WlCompositor, _, _>(&qh, 4..=6, ())
@@ -578,6 +602,7 @@ impl<S: X11Selection> ServerState<NoConnection<S>> {
             last_focused_toplevel: None,
             last_hovered: None,
             xdg_wm_base,
+            layer_shell,
             compositor,
             subcompositor,
             shm,
@@ -1131,6 +1156,23 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
                 );
                 popup.popup.reposition(&popup.positioner, 0);
             }
+            SurfaceRole::LayerSurface(Some(layer)) => {
+                let margin_left =
+                    ((event.x() as i32 - win.output_offset.x) as f64 / scale_factor.0) as i32;
+                let margin_top =
+                    ((event.y() as i32 - win.output_offset.y) as f64 / scale_factor.0) as i32;
+                let width = 1.max((event.width() as f64 / scale_factor.0) as u32);
+                let height = 1.max((event.height() as f64 / scale_factor.0) as u32);
+                layer.layer_surface.set_size(width, height);
+                layer.layer_surface.set_margin(margin_top, 0, 0, margin_left);
+                drop(query);
+                drop(win);
+                let surface = data
+                    .get::<&client::wl_surface::WlSurface>()
+                    .unwrap()
+                    .clone();
+                surface.commit();
+            }
             SurfaceRole::Toplevel(Some(_)) => {
                 win.attrs.dims.width = dims.width;
                 win.attrs.dims.height = dims.height;
@@ -1399,6 +1441,31 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
     /// Creates the appropriate xdg role (toplevel or popup) for the given window.
     /// Returns `true` if the created window is a toplevel.
     fn create_role_window(&mut self, window: x::Window, entity: Entity) -> bool {
+        let is_or = {
+            let data = self.world.entity(entity).unwrap();
+            data.get::<&WindowData>().unwrap().attrs.override_redirect
+        };
+
+        if is_or && self.layer_shell.is_some() {
+            // override_redirect windows use layer shell for proper overlay behavior
+            // Attach null buffer and commit before creating layer surface role
+            let did_commit = {
+                let data = self.world.entity(entity).unwrap();
+                let surface = data.get::<&client::wl_surface::WlSurface>().unwrap();
+                surface.attach(None, 0, 0);
+                surface.commit();
+                surface.clone()
+            };
+            drop(did_commit);
+
+            let layer_data = self.create_layer_surface(entity);
+            self.world
+                .insert(entity, (SurfaceRole::LayerSurface(Some(layer_data)),))
+                .unwrap();
+            return false;
+        }
+
+        // Non-OR windows: use XDG shell
         let xdg_surface;
         let mut popup_for = None;
         let mut fullscreen = false;
@@ -1454,6 +1521,75 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         self.world.insert(entity, (role,)).unwrap();
 
         is_toplevel
+    }
+
+    fn create_layer_surface(&mut self, entity: Entity) -> LayerSurfaceData {
+        let mut query = self
+            .world
+            .query_one::<(&client::wl_surface::WlSurface, &WindowData, &SurfaceScaleFactor)>(
+                entity,
+            )
+            .unwrap();
+        let (surface, window, scale) = query.get().unwrap();
+        let surface = surface.clone();
+        let dims = window.attrs.dims;
+        let output_offset = window.output_offset;
+        let scale = scale.0;
+        drop(query);
+
+        // Find which output contains this window
+        let output = self
+            .world
+            .query::<(&client::wl_output::WlOutput, &OutputDimensions)>()
+            .iter()
+            .find(|(_, (_, out_dims))| {
+                let local_x = dims.x as i32 - output_offset.x;
+                let local_y = dims.y as i32 - output_offset.y;
+                local_x >= out_dims.x
+                    && local_y >= out_dims.y
+                    && local_x < out_dims.x + out_dims.width
+                    && local_y < out_dims.y + out_dims.height
+            })
+            .map(|(_, (output, _))| output.clone());
+
+        let layer_surface = self.layer_shell.as_ref().unwrap().get_layer_surface(
+            &surface,
+            output.as_ref(),
+            zwlr_layer_shell_v1::Layer::Overlay,
+            "xwayland-satellite".to_string(),
+            &self.qh,
+            entity,
+        );
+
+        // Position relative to the output — initial size before scale is known.
+        // Margins are set to zero here and updated in the configure handler
+        // once the fractional scale factor is available.
+        let width = (dims.width as f64 / scale).ceil() as u32;
+        let height = (dims.height as f64 / scale).ceil() as u32;
+
+        layer_surface.set_size(width.max(1), height.max(1));
+        layer_surface.set_anchor(
+            zwlr_layer_surface_v1::Anchor::Top | zwlr_layer_surface_v1::Anchor::Left,
+        );
+        // Set zero margins initially — they will be updated after the first configure
+        // when the correct scale factor is known (from fractional scale).
+        layer_surface.set_margin(0, 0, 0, 0);
+        layer_surface.set_keyboard_interactivity(
+            zwlr_layer_surface_v1::KeyboardInteractivity::None,
+        );
+        layer_surface.set_exclusive_zone(-1);
+
+        surface.commit();
+
+        debug!(
+            "created layer surface for {:?}: {width}x{height}",
+            *self.world.get::<&x::Window>(entity).unwrap()
+        );
+
+        LayerSurfaceData {
+            layer_surface,
+            configured: false,
+        }
     }
 
     fn create_toplevel(

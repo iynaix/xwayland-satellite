@@ -28,6 +28,10 @@ use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle, delegate_noop, event_created_child,
     globals::{Global, GlobalList, GlobalListContents},
 };
+use wayland_protocols_wlr::layer_shell::v1::client::{
+    zwlr_layer_shell_v1::ZwlrLayerShellV1,
+    zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+};
 use wayland_protocols::{
     wp::{
         fractional_scale::v1::client::{
@@ -190,6 +194,7 @@ delegate_noop!(MyWorld: ZwpPointerConstraintsV1);
 delegate_noop!(MyWorld: ZwpTabletManagerV2);
 delegate_noop!(MyWorld: XdgActivationV1);
 delegate_noop!(MyWorld: ZxdgDecorationManagerV1);
+delegate_noop!(MyWorld: ZwlrLayerShellV1);
 delegate_noop!(MyWorld: WpFractionalScaleManagerV1);
 delegate_noop!(MyWorld: ZwpPrimarySelectionDeviceManagerV1);
 delegate_noop!(MyWorld: WlSubsurface);
@@ -303,6 +308,7 @@ push_events!(ZwpConfinedPointerV1);
 push_events!(ZwpLockedPointerV1);
 push_events!(WpFractionalScaleV1);
 push_events!(ZxdgToplevelDecorationV1);
+push_events!(ZwlrLayerSurfaceV1);
 
 pub(crate) struct LateInitObjectKey<P: Proxy> {
     key: OnceLock<Entity>,
